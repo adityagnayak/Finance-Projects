@@ -1,0 +1,182 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import norm
+import datetime as dt
+
+# --- SECTION 1: DATA ACQUISITION ---
+# We define our portfolio assets and their target weights.
+tickers = ['SPY', 'GLD', 'SOXX']
+weights = np.array([0.40, 0.30, 0.30])  # 40% SPY, 30% GLD, 30% SOXX
+
+# Calculate the start date (5 years ago from today)
+end_date = dt.datetime.now()
+start_date = end_date - dt.timedelta(days=5*365)
+
+print("Downloading data...")
+# Download Adjusted Close prices (accounts for dividends/splits)
+data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
+
+# Calculate Daily Returns (Percentage Change)
+# We drop the first row because it will be NaN (cannot calculate change for the first day)
+returns = data.pct_change().dropna()
+
+# Calculate 'Weighted Portfolio Returns'
+# We multiply the returns matrix by our weights to get the daily performance of the total portfolio
+portfolio_returns = returns.dot(weights)
+
+print(f"Data downloaded successfully. Shape: {returns.shape}")
+print("-" * 50)
+
+
+# --- SECTION 2: VaR CALCULATIONS ---
+
+# Helper variables for calculations
+initial_investment = 100000  # Assume a $100,000 portfolio for dollar value context
+conf_level_95 = 0.95
+conf_level_99 = 0.99
+
+mean_return = portfolio_returns.mean()
+std_dev = portfolio_returns.std()
+
+# --- Method A: Parametric (Variance-Covariance) VaR ---
+# Logic: Assumes returns follow a Normal (Gaussian) Distribution.
+# We use the standard deviation (volatility) to determine where the cutoff is.
+# norm.ppf returns the "Z-score" for a given probability.
+
+# For 95% confidence, we look at the bottom 5% (1 - 0.95)
+var_95_param = norm.ppf(1 - conf_level_95, mean_return, std_dev)
+var_99_param = norm.ppf(1 - conf_level_99, mean_return, std_dev)
+
+print(f"--- Parametric VaR (Normal Distribution) ---")
+print(f"95% VaR: {var_95_param:.2%} (Loss of ${-var_95_param * initial_investment:,.2f})")
+print(f"99% VaR: {var_99_param:.2%} (Loss of ${-var_99_param * initial_investment:,.2f})")
+print("")
+
+
+# --- Method B: Historical Simulation VaR ---
+# Logic: Look at the ACTUAL past returns and find the cutoff.
+# If we have 1000 days, the 95% VaR is the return better than only the worst 50 days.
+# No assumptions about Normal Distribution here (captures "Fat Tails").
+
+var_95_hist = np.percentile(portfolio_returns, (1 - conf_level_95) * 100)
+var_99_hist = np.percentile(portfolio_returns, (1 - conf_level_99) * 100)
+
+print(f"--- Historical Simulation VaR ---")
+print(f"95% VaR: {var_95_hist:.2%} (Loss of ${-var_95_hist * initial_investment:,.2f})")
+print(f"99% VaR: {var_99_hist:.2%} (Loss of ${-var_99_hist * initial_investment:,.2f})")
+print("")
+
+
+# --- Method C: Monte Carlo Simulation VaR ---
+# Logic: Generate thousands of fake market scenarios.
+# CRITICAL: Assets are correlated (e.g., SOXX and SPY often move together).
+# We cannot just generate random numbers for each; we must link them using the Covariance Matrix.
+# Math: We use Cholesky Decomposition (L) of the Covariance Matrix (Sigma).
+# Formula: Simulated_Returns = Mean + L * Random_Normal_Variables
+
+mc_sims = 10000  # Number of simulations
+time_horizon = 1 # 1 Day
+
+# 1. Calculate Mean Returns and Covariance Matrix of the individual assets
+mean_returns = returns.mean().values
+cov_matrix = returns.cov().values
+
+# 2. Perform Cholesky Decomposition
+# This creates a Lower Triangular Matrix (L) such that L * L.T = Covariance Matrix
+L = np.linalg.cholesky(cov_matrix)
+
+# 3. Generate Random Variables (Uncorrelated)
+# Shape: (3 assets, 10000 simulations)
+Z = np.random.normal(0, 1, (len(tickers), mc_sims))
+
+# 4. Apply Correlation
+# Correlated_Randoms = L dot Z
+correlated_shocks = L.dot(Z)
+
+# 5. Construct Simulated Returns
+# We add the mean return to the shocks. Transpose to get shape (10000, 3)
+simulated_asset_returns = mean_returns[:, np.newaxis] + correlated_shocks
+simulated_asset_returns = simulated_asset_returns.T
+
+# 6. Calculate Portfolio Returns for each simulation
+simulated_portfolio_returns = simulated_asset_returns.dot(weights)
+
+# 7. Find Percentiles from the simulations
+var_95_mc = np.percentile(simulated_portfolio_returns, (1 - conf_level_95) * 100)
+var_99_mc = np.percentile(simulated_portfolio_returns, (1 - conf_level_99) * 100)
+
+print(f"--- Monte Carlo Simulation VaR (10,000 runs) ---")
+print(f"95% VaR: {var_95_mc:.2%} (Loss of ${-var_95_mc * initial_investment:,.2f})")
+print(f"99% VaR: {var_99_mc:.2%} (Loss of ${-var_99_mc * initial_investment:,.2f})")
+print("-" * 50)
+
+
+# --- SECTION 3: HISTORICAL STRESS TESTING ---
+
+def calculate_max_drawdown(return_series):
+    """
+    Calculates Max Drawdown: The maximum observed loss from a peak to a trough.
+    1. Convert daily returns to a cumulative wealth index (Growth of $1).
+    2. Track the running maximum (Peak).
+    3. Calculate the percentage drop from that Peak (Drawdown).
+    """
+    compounded_growth = (1 + return_series).cumprod()
+    running_max = compounded_growth.cummax()
+    drawdown = (compounded_growth - running_max) / running_max
+    return drawdown.min()
+
+# Define Stress Periods
+stress_periods = {
+    "COVID-19 Crash": ('2020-02-01', '2020-04-30'),
+    "2022 Tech Slump": ('2022-01-01', '2022-10-31')
+}
+
+print("--- Historical Stress Testing (Max Drawdown) ---")
+for event, (start, end) in stress_periods.items():
+    # Slice the data for the specific dates
+    period_returns = portfolio_returns.loc[start:end]
+    
+    if period_returns.empty:
+        print(f"{event}: Data not available for this range.")
+        continue
+
+    mdd = calculate_max_drawdown(period_returns)
+    print(f"{event} ({start} to {end}):")
+    print(f"  Max Drawdown: {mdd:.2%} (Loss of ${-mdd * initial_investment:,.2f} on ${initial_investment:,.0f})")
+print("-" * 50)
+
+
+# --- SECTION 4: VISUALIZATION ---
+
+plt.figure(figsize=(12, 6))
+sns.set_style("whitegrid")
+
+# 1. Plot the Distribution of Daily Returns (Histogram + KDE)
+sns.histplot(portfolio_returns, bins=50, kde=True, color='skyblue', stat='density', label='Daily Returns')
+
+# 2. Add Vertical Lines for VaR Thresholds (Using Historical Calculation)
+plt.axvline(var_95_hist, color='orange', linestyle='--', linewidth=2, label=f'95% VaR: {var_95_hist:.2%}')
+plt.axvline(var_99_hist, color='red', linestyle='--', linewidth=2, label=f'99% VaR: {var_99_hist:.2%}')
+
+# 3. Highlight the "Tail Risk" Area
+# Create an array of x-values for shading
+x_min, x_max = plt.xlim()
+x_shade = np.linspace(x_min, var_95_hist, 100) 
+# Note: We just shade everything to the left of 95% VaR for visual impact
+
+# Get the Y-values of the KDE line to fill under it accurately would be complex, 
+# so we simply use a span or standard fill for visual indication of the "Danger Zone".
+plt.axvspan(x_min, var_95_hist, color='red', alpha=0.1, label='Tail Risk Zone')
+
+# Formatting
+plt.title(f'Portfolio Risk Profile: Distribution of Daily Returns\n(SPY 40% | GLD 30% | SOXX 30%)', fontsize=14)
+plt.xlabel('Daily Return')
+plt.ylabel('Density')
+plt.legend()
+plt.xlim(portfolio_returns.min()*1.2, portfolio_returns.max()*1.2) # Zoom to data
+
+plt.tight_layout()
+plt.show()
